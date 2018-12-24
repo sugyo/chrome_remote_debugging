@@ -1,4 +1,4 @@
-#!python
+#!/usr/bin/env python3
 #
 # Page.addScriptToEvaluateOnNewDocument sample
 
@@ -110,13 +110,6 @@ class ChromeRemoteDebugging:
         self._browser = None
         self._tab = None
 
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_value, tb):
-        self.stop()
-
     def start(self):
         if self._browser:
             raise RuntimeError('Browser is already running')
@@ -161,7 +154,13 @@ class ChromeRemoteDebugging:
         logger.info('{}: {} {}'.format(timestamp, url, status))
 
     def add_script(self, source):
-        self._tab.Page.addScriptToEvaluateOnNewDocument(source=source)
+        response = self._tab.Page.addScriptToEvaluateOnNewDocument(
+            source=source)
+        return response['identifier']
+
+    def remove_script(self, script_id):
+        self._tab.Page.removeScriptToEvaluateOnNewDocument(
+            identifier=script_id)
 
     def navigate(self, url):
         self._tab.Page.navigate(url=url)
@@ -169,27 +168,107 @@ class ChromeRemoteDebugging:
 
 if __name__ == '__main__':
 
-    import click
+    import argparse
+    import cmd
+    import shlex
+    import sys
 
     logger.setLevel(logging.DEBUG)
 
-    @click.command()
-    @click.option('--url')
-    def main(url):
-        with ChromeRemoteDebugging() as chrome:
-            source = '''
+    class ArgumentParserError(Exception):
+        pass
+
+    class ArgumentParser(argparse.ArgumentParser):
+        def __init__(self, prog, description):
+            super().__init__(
+                prog=prog, description=description, add_help=False)
+            self.add_argument(
+                '-h', '--help',
+                action='help',
+                default=argparse.SUPPRESS,
+                help='show this help message',
+            )
+
+        def exit(self, status=0, message=None):
+            if message:
+                self._print_message(message, sys.stderr)
+            raise ArgumentParserError()
+
+    class ChromeRemoteDebuggingShell(cmd.Cmd):
+        intro = 'Welcome to the CRD shell.'
+        prompt = '> '
+
+        def preloop(self):
+            self.chrome = ChromeRemoteDebugging()
+            self.chrome.start()
+            self._script_id = None
+            self._script = '''
 window.addEventListener("beforeunload", function (event) {
   event.preventDefault();
   event.returnValue = '';
 });
             '''
-            chrome.add_script(source=source)
-            if url:
-                chrome.navigate(url=url)
+            self.do_beforeunload('on')
 
-            try:
-                chrome.wait()
-            except KeyboardInterrupt:
-                pass
+        def postloop(self):
+            self.chrome.stop()
 
-    main()
+        def argument_parser(f):
+            prog = f.__name__[3:]
+
+            def wrapper(cls, arg):
+                argv = shlex.split(arg)
+                try:
+                    return f(cls, prog, argv)
+                except ArgumentParserError:
+                    pass
+            return wrapper
+
+        @argument_parser
+        def do_beforeunload(self, prog, argv):
+            parser = ArgumentParser(
+                prog=prog, description='Beforeunload on/off.')
+            parser.add_argument('op', choices=['status', 'show', 'on', 'off'])
+            args = parser.parse_args(args=argv)
+            if args.op == 'status':
+                print('{}'.format('on' if self._script_id else 'off'))
+            elif args.op == 'show':
+                print('{}'.format(self._script))
+            elif args.op == 'on' and self._script_id is None:
+                self._script_id = self.chrome.add_script(source=self._script)
+            elif args.op == 'off' and self._script_id is not None:
+                self.chrome.remove_script(script_id=self._script_id)
+                self._script_id = None
+
+        @argument_parser
+        def do_open(self, prog, argv):
+            parser = ArgumentParser(prog=prog, description='Open a URL.')
+            parser.add_argument('url', help='URL')
+            args = parser.parse_args(args=argv)
+            self.chrome.navigate(url=args.url)
+
+        def help_ls(self):
+            self.do_ls('--help')
+
+        @argument_parser
+        def do_exit(self, prog, argv):
+            parser = ArgumentParser(
+                prog=prog, description='Exits the program.')
+            parser.parse_args(args=argv)
+            return True
+
+        def help_exit(self):
+            self.do_exit('--help')
+
+        def emptyline(self):
+            pass
+
+        def precmd(self, line):
+            return re.sub(r'^(bye|quit|EOF)', 'exit', line)
+
+    parser = argparse.ArgumentParser()
+    args = parser.parse_args()
+    try:
+        ChromeRemoteDebuggingShell().cmdloop()
+    except KeyboardInterrupt:
+        pass
